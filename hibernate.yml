@@ -9,6 +9,10 @@
 #   2. Polkit override — Ubuntu ships a rule that disables hibernate for all
 #      users; this restores the upstream default (allow active local sessions).
 #   3. Disables the plain-dm-crypt cryptswap (random key = can't resume).
+#   4. systemd override — COSMIC only offers "Suspend"; redirects it to
+#      hibernate so the UI button triggers hibernation.
+#   5. GNOME power setting — lid-close triggers hibernate even with
+#      external monitors connected.
 #
 # Targets: Pop!_OS with kernelstub (systemd-boot), LUKS+LVM root, and polkit.
 # Idempotent — safe to re-run after kernel/initramfs updates.
@@ -300,6 +304,49 @@
         replace: '# DISABLED for hibernation: \1'
       register: crypttab_swap
 
+
+    # ── systemd suspend→hibernate redirect ──────────────────────────────────
+    # COSMIC only offers a "Suspend" button; redirect suspend to hibernate
+    # so the UI triggers hibernation instead of s2idle.
+    - name: Create systemd drop-in directory for suspend override
+      ansible.builtin.file:
+        path: /etc/systemd/system/systemd-suspend.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy systemd override — suspend calls hibernate
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/systemd-suspend.service.d/override.conf
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/lib/systemd/systemd-sleep hibernate
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload systemd
+
+
+    # ── GNOME power settings ────────────────────────────────────────────────
+    # COSMIC defaults to ignoring lid-close when external monitors are
+    # connected.  Override so lid-close always hibernates — the systemd
+    # suspend→hibernate redirect handles the rest.
+    - name: Enable lid-close to hibernate with external monitors
+      ansible.builtin.shell: |
+        for home in /home/*; do
+          [ -f "${home}/.config/dconf/user" ] || continue
+          user=$(basename "${home}")
+          uid=$(id -u "${user}" 2>/dev/null) || continue
+          sudo -u "${user}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+            gsettings set org.gnome.settings-daemon.plugins.power \
+            lid-close-suspend-with-external-monitor true
+        done
+      changed_when: true
+      register: _lid_close
+      failed_when: false
+
     # ── Handlers ───────────────────────────────────────────────────────────
   handlers:
     - name: rebuild initramfs
@@ -311,3 +358,7 @@
         cmd: kernelstub -v
       when: kernelstub_bin.stat.exists | default(false)
       listen: rebuild initramfs
+
+    - name: reload systemd
+      ansible.builtin.command:
+        cmd: systemctl daemon-reload
