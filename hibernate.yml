@@ -11,8 +11,6 @@
 #   3. Disables the plain-dm-crypt cryptswap (random key = can't resume).
 #   4. systemd override — COSMIC only offers "Suspend"; redirects it to
 #      hibernate so the UI button triggers hibernation.
-#   5. GNOME power setting — lid-close triggers hibernate even with
-#      external monitors connected.
 #
 # Targets: Pop!_OS with kernelstub (systemd-boot), LUKS+LVM root, and polkit.
 # Idempotent — safe to re-run after kernel/initramfs updates.
@@ -327,25 +325,6 @@
         group: root
         mode: '0644'
       notify: reload systemd
-
-
-    # ── GNOME power settings ────────────────────────────────────────────────
-    # COSMIC defaults to ignoring lid-close when external monitors are
-    # connected.  Override so lid-close always hibernates — the systemd
-    # suspend→hibernate redirect handles the rest.
-    - name: Enable lid-close to hibernate with external monitors
-      ansible.builtin.shell: |
-        for home in /home/*; do
-          [ -f "${home}/.config/dconf/user" ] || continue
-          user=$(basename "${home}")
-          uid=$(id -u "${user}" 2>/dev/null) || continue
-          sudo -u "${user}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
-            gsettings set org.gnome.settings-daemon.plugins.power \
-            lid-close-suspend-with-external-monitor true
-        done
-      changed_when: true
-      register: _lid_close
-      failed_when: false
 
     # ── Handlers ───────────────────────────────────────────────────────────
   handlers:
