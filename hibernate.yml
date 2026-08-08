@@ -1,0 +1,313 @@
+---
+# hibernate.yml — enable hibernation (suspend-to-disk) on Pop!_OS 24.04
+#
+# Hardware target: 2025 ASUS ProArt P16 H7606WX (AMD Ryzen AI 9 HX 370 + NVIDIA)
+# Pre-flight checks verify the exact DMI strings, CPU, GPU, and OS before
+# touching anything. Set `hardware_check: false` to skip for similar hardware.
+#
+#   1. Swapfile-based hibernation on the encrypted root (no partition resize).
+#   2. Polkit override — Ubuntu ships a rule that disables hibernate for all
+#      users; this restores the upstream default (allow active local sessions).
+#   3. Disables the plain-dm-crypt cryptswap (random key = can't resume).
+#
+# Targets: Pop!_OS with kernelstub (systemd-boot), LUKS+LVM root, and polkit.
+# Idempotent — safe to re-run after kernel/initramfs updates.
+#
+# Usage:
+#   ansible-playbook -i localhost, -c local -K main.yml        (all fixes)
+#   ansible-playbook -i localhost, -c local -K hibernate.yml   (this playbook)
+
+- name: Configure hibernation
+  hosts: all
+  become: true
+  vars:
+    # Swapfile size in GiB. Default: match total RAM (minimum for full hibernation).
+    swapfile_size_gib: "{{ ((ansible_facts['memtotal_mb'] / 1024) | round(0, 'ceil') | int) | default(64) }}"
+    swapfile_path: /swapfile
+    kernelstub_conf: /etc/kernelstub/configuration
+    polkit_rule_name: 10-enable-hibernate.rules
+    polkit_rules_dir: /etc/polkit-1/rules.d
+    hardware_check: true
+
+  pre_tasks:
+    # ── Flight checks: DMI, CPU, GPU, OS ────────────────────────────────────
+    - name: Pre-flight — collect DMI and CPU info
+      when: hardware_check | bool
+      block:
+        - name: Read system manufacturer
+          ansible.builtin.command:
+            cmd: dmidecode -s system-manufacturer
+          register: dmi_manufacturer
+          changed_when: false
+          check_mode: false
+
+        - name: Read system product name
+          ansible.builtin.command:
+            cmd: dmidecode -s system-product-name
+          register: dmi_product
+          changed_when: false
+          check_mode: false
+
+        - name: Read BIOS version
+          ansible.builtin.command:
+            cmd: dmidecode -s bios-version
+          register: dmi_bios
+          changed_when: false
+          check_mode: false
+
+        - name: Read CPU model
+          ansible.builtin.shell:
+            cmd: "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs"
+          register: cpu_model
+          changed_when: false
+          check_mode: false
+
+        - name: Scan PCI for NVIDIA GPU
+          ansible.builtin.shell:
+            cmd: "lspci -d 10de: | head -1 || true"
+          register: nvidia_pci
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Scan PCI for AMD iGPU
+          ansible.builtin.shell:
+            cmd: "lspci -d 1002: | grep -i display | head -1 || true"
+          register: amd_pci
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Assert system manufacturer is ASUSTeK
+          ansible.builtin.assert:
+            that: dmi_manufacturer.stdout is search('ASUSTeK')
+            fail_msg: >-
+              Expected system-manufacturer 'ASUSTeK COMPUTER INC.',
+              got '{{ dmi_manufacturer.stdout }}'.
+              Set hardware_check: false to skip.
+
+        - name: Assert product is ProArt P16 H7606WX
+          ansible.builtin.assert:
+            that: dmi_product.stdout is search('H7606WX')
+            fail_msg: >-
+              Expected ProArt P16 H7606WX (DMI product contains 'H7606WX'),
+              got '{{ dmi_product.stdout }}'.
+              Set hardware_check: false to skip.
+
+        - name: Assert BIOS >= H7606WX.304
+          ansible.builtin.assert:
+            that: dmi_bios.stdout is version('H7606WX.304', '>=')
+            fail_msg: >-
+              BIOS {{ dmi_bios.stdout }} is older than H7606WX.304.
+              Update via fwupd or EZ Flash before enabling hibernation.
+
+        - name: Assert CPU is AMD Ryzen AI 9 HX 370
+          ansible.builtin.assert:
+            that: cpu_model.stdout is search('Ryzen AI 9 HX 370')
+            fail_msg: >-
+              Expected 'AMD Ryzen AI 9 HX 370 w/ Radeon 890M',
+              got '{{ cpu_model.stdout }}'.
+              Set hardware_check: false to skip.
+
+        - name: Assert NVIDIA dGPU present
+          ansible.builtin.assert:
+            that: nvidia_pci.stdout | length > 0
+            fail_msg: >-
+              No NVIDIA GPU found on PCI bus (vendor 10de).
+              Hibernation may still work, but NVIDIA suspend/resume hooks
+              will be non-functional. Set hardware_check: false to skip.
+
+        - name: Assert AMD iGPU present
+          ansible.builtin.assert:
+            that: amd_pci.stdout | length > 0
+            fail_msg: >-
+              No AMD display controller found on PCI bus (vendor 1002).
+              Set hardware_check: false to skip.
+
+    - name: Pre-flight — verify Pop!_OS with kernelstub
+      when: hardware_check | bool
+      block:
+        - name: Check /etc/os-release for Pop!_OS
+          ansible.builtin.shell:
+            cmd: ". /etc/os-release && echo $ID"
+          register: os_id
+          changed_when: false
+          check_mode: false
+
+        - name: Assert OS is Pop!_OS
+          ansible.builtin.assert:
+            that: os_id.stdout == 'pop'
+            fail_msg: >-
+              Expected OS ID 'pop', got '{{ os_id.stdout }}'.
+              This playbook targets Pop!_OS specifically.
+              Set hardware_check: false to skip.
+
+        - name: Assert kernelstub is installed
+          ansible.builtin.stat:
+            path: /usr/bin/kernelstub
+          register: _kernelstub_preflight
+          failed_when: >-
+            hardware_check | bool and not _kernelstub_preflight.stat.exists
+
+  tasks:
+    # ── Detect root device ─────────────────────────────────────────────────
+    - name: Determine root block device
+      ansible.builtin.command:
+        cmd: findmnt -n -o SOURCE /
+      register: root_dev
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve root UUID for resume= parameter
+      ansible.builtin.command:
+        cmd: blkid -s UUID -o value {{ root_dev.stdout }}
+      register: root_uuid
+      changed_when: false
+      check_mode: false
+
+    # ── Swapfile ───────────────────────────────────────────────────────────
+    - name: Check if swapfile exists and is correct size
+      ansible.builtin.stat:
+        path: "{{ swapfile_path }}"
+      register: swapfile_stat
+
+    - name: Compute required swapfile size in bytes
+      ansible.builtin.set_fact:
+        swapfile_bytes: "{{ swapfile_size_gib | int * 1024 * 1024 * 1024 }}"
+
+    - name: Create swapfile
+      ansible.builtin.command:
+        cmd: fallocate -l {{ swapfile_size_gib }}G {{ swapfile_path }}
+      when: >-
+        not swapfile_stat.stat.exists
+        or swapfile_stat.stat.size < swapfile_bytes | int
+
+    - name: Set swapfile permissions
+      ansible.builtin.file:
+        path: "{{ swapfile_path }}"
+        mode: '0600'
+        owner: root
+        group: root
+
+    - name: Format swapfile
+      ansible.builtin.command:
+        cmd: mkswap {{ swapfile_path }}
+      when: >-
+        not swapfile_stat.stat.exists
+        or swapfile_stat.stat.size < swapfile_bytes | int
+      # mkswap reports "created" on stderr; treat that as ok
+
+    # ── Resume offset ──────────────────────────────────────────────────────
+    - name: Run filefrag to get swapfile extent map
+      ansible.builtin.command:
+        cmd: filefrag -v {{ swapfile_path }}
+      register: filefrag_output
+      changed_when: false
+      check_mode: false
+
+    - name: Extract resume_offset from filefrag output
+      ansible.builtin.set_fact:
+        resume_offset: >-
+          {{ filefrag_output.stdout_lines
+             | select('search', '^\s+\d+:')
+             | first
+             | regex_replace('^.*:\s+(\d+)\.\..*$', '\1') }}
+
+    - name: Abort if resume_offset is empty
+      ansible.builtin.fail:
+        msg: "Could not determine resume_offset — check filefrag -v {{ swapfile_path }}"
+      when: resume_offset | trim == ''
+
+    # ── /etc/fstab ─────────────────────────────────────────────────────────
+    - name: Comment out old disk-swap entries in fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(?!# hibernation: disabled -- )(/dev/mapper/cryptswap\s+none\s+swap.*)$'
+        replace: '# hibernation: disabled -- \1'
+      register: fstab_old_swap
+
+    - name: Ensure swapfile entry in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "{{ swapfile_path }}  none  swap  sw  0  0"
+        regexp: '^{{ swapfile_path }}\s'
+        state: present
+
+    - name: Activate swapfile
+      ansible.builtin.command:
+        cmd: swapon {{ swapfile_path }}
+      register: swapon_result
+      changed_when: false
+      failed_when: false
+
+    # ── kernelstub ─────────────────────────────────────────────────────────
+    - name: Check kernelstub availability
+      ansible.builtin.stat:
+        path: /usr/bin/kernelstub
+      register: kernelstub_bin
+
+    - name: Check kernelstub config exists
+      ansible.builtin.stat:
+        path: "{{ kernelstub_conf }}"
+      register: kernelstub_conf_stat
+
+    - name: Add resume= and resume_offset= to kernelstub user options
+      ansible.builtin.shell: |
+        python3 -c "
+        import json
+        conf = '{{ kernelstub_conf }}'
+        resume_dev = 'UUID={{ root_uuid.stdout }}'
+        resume_offset = '{{ resume_offset | trim }}'
+
+        with open(conf) as f:
+            config = json.load(f)
+
+        user = config.setdefault('user', {})
+        opts = user.setdefault('kernel_options', [])
+
+        # Remove stale resume params
+        opts[:] = [o for o in opts if not o.startswith('resume=') and not o.startswith('resume_offset=')]
+
+        # Add current params
+        opts.append(f'resume={resume_dev}')
+        opts.append(f'resume_offset={resume_offset}')
+
+        user['kernel_options'] = opts
+
+        with open(conf, 'w') as f:
+            json.dump(config, f, indent=2)
+            f.write('\n')
+        "
+      register: kernelstub_update
+      changed_when: true
+      when: kernelstub_conf_stat.stat.exists
+      notify: rebuild initramfs
+
+    # ── Polkit ─────────────────────────────────────────────────────────────
+    - name: Deploy polkit override for hibernation
+      ansible.builtin.copy:
+        src: files/10-enable-hibernate.rules
+        dest: "{{ polkit_rules_dir }}/{{ polkit_rule_name }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    # ── crypttab ───────────────────────────────────────────────────────────
+    - name: Disable plain-dm-crypt cryptswap (random key = cannot resume)
+      ansible.builtin.replace:
+        path: /etc/crypttab
+        regexp: '^(cryptswap\s+UUID=[0-9a-f-]+\s+/dev/urandom\s+swap.*)$'
+        replace: '# DISABLED for hibernation: \1'
+      register: crypttab_swap
+
+    # ── Handlers ───────────────────────────────────────────────────────────
+  handlers:
+    - name: rebuild initramfs
+      ansible.builtin.command:
+        cmd: update-initramfs -u -k all
+
+    - name: update kernelstub
+      ansible.builtin.command:
+        cmd: kernelstub -v
+      when: kernelstub_bin.stat.exists | default(false)
+      listen: rebuild initramfs

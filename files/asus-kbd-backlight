@@ -1,0 +1,27 @@
+#!/bin/sh
+# Enable ASUS keyboard backlight during initramfs, before the LUKS
+# passphrase prompt appears.  The asus_nb_wmi module creates
+# /sys/class/leds/asus::kbd_backlight/ once loaded.
+#
+# Runs at init-premount stage, which is before cryptsetup's local-top hook.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+# Module should already be loaded via /etc/initramfs-tools/modules.d/,
+# but force it just in case.
+modprobe -q asus_nb_wmi 2>/dev/null || true
+
+# Wait up to 2 seconds for the backlight node to appear.
+BACKLIGHT=/sys/class/leds/asus::kbd_backlight/brightness
+for _ in $(seq 1 20); do
+    if [ -w "$BACKLIGHT" ]; then
+        echo 1 > "$BACKLIGHT"
+        break
+    fi
+    sleep 0.1
+done

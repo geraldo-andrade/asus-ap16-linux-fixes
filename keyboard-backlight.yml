@@ -1,0 +1,56 @@
+---
+# keyboard-backlight.yml — ASUS keyboard backlight fixes
+#
+# Hardware target: 2025 ASUS ProArt P16 H7606WX (asus_nb_wmi backlight)
+#
+#   1. Loads asus_nb_wmi in the initramfs so the backlight node exists
+#      before the LUKS passphrase prompt.
+#   2. init-premount hook turns the backlight on during initramfs.
+#   3. Seeds the systemd-backlight save file so the backlight stays lit
+#      at the login screen.
+#
+# Idempotent — safe to re-run after kernel/initramfs updates.
+#
+# Usage:
+#   ansible-playbook -i localhost, -c local -K main.yml                (all fixes)
+#   ansible-playbook -i localhost, -c local -K keyboard-backlight.yml  (this playbook)
+
+- name: Configure keyboard backlight
+  hosts: all
+  become: true
+  vars:
+    # Keyboard backlight brightness at login screen: 1 (min) – 3 (max).
+    kbd_backlight_brightness: '1'
+
+  tasks:
+    # ── Keyboard backlight during initramfs ────────────────────────────────
+    - name: Ensure asus_nb_wmi module is loaded during initramfs
+      ansible.builtin.lineinfile:
+        path: /etc/initramfs-tools/modules
+        line: asus_nb_wmi
+        regexp: '^asus_nb_wmi$'
+        state: present
+      notify: rebuild initramfs
+
+    - name: Deploy init-premount backlight script
+      ansible.builtin.copy:
+        src: files/asus-kbd-backlight
+        dest: /etc/initramfs-tools/scripts/init-premount/asus-kbd-backlight
+        owner: root
+        group: root
+        mode: '0755'
+      notify: rebuild initramfs
+
+    # ── Keyboard backlight for login screen ───────────────────────────────
+    - name: Seed systemd-backlight save file for keyboard backlight
+      ansible.builtin.copy:
+        content: "{{ kbd_backlight_brightness | default('1') }}\n"
+        dest: /var/lib/systemd/leds/platform-asus-nb-wmi:leds:asus::kbd_backlight
+        owner: root
+        group: root
+        mode: '0644'
+
+  handlers:
+    - name: rebuild initramfs
+      ansible.builtin.command:
+        cmd: update-initramfs -u -k all

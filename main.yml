@@ -1,0 +1,12 @@
+---
+# main.yml — run all ASUS ProArt P16 fixes in one invocation.
+#
+#   hibernate.yml           — swapfile-based hibernation, resume kernel params,
+#                             polkit override, cryptswap disable
+#   keyboard-backlight.yml  — initramfs backlight script + login-screen seed
+#
+# Usage:
+#   ansible-playbook -i localhost, -c local -K main.yml
+
+- ansible.builtin.import_playbook: hibernate.yml
+- ansible.builtin.import_playbook: keyboard-backlight.yml
